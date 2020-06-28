@@ -3302,9 +3302,13 @@ void cCamSlot::StartDecrypting(void)
 void cCamSlot::StopDecrypting(void)
 {
   cMutexLock MutexLock(&mutex);
+  if (mtdHandler) {
+     mtdHandler->StopDecrypting();
+     return;
+     }
   if (caProgramList.Count()) {
      caProgramList.Clear();
-     if (!dynamic_cast<cMtdCamSlot *>(this))
+     if (!dynamic_cast<cMtdCamSlot *>(this) || !MasterSlot()->IsDecrypting())
         SendCaPmt(CPCI_NOT_SELECTED);
      }
 }

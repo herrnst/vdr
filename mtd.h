@@ -145,6 +145,8 @@ public:
       ///< Returns true if any of the active MTD CAM slots is currently decrypting.
   void StartDecrypting(void);
       ///< Tells all active MTD CAM slots to start decrypting.
+  void StopDecrypting(void);
+      ///< Tells all active MTD CAM slots to stop decrypting.
   void CancelActivation(void);
       ///< Tells all active MTD CAM slots to cancel activation.
   bool IsActivating(void);

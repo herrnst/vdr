@@ -177,6 +177,15 @@ void cMtdHandler::StartDecrypting(void)
       }
 }
 
+void cMtdHandler::StopDecrypting(void)
+{
+  for (int i = 0; i < camSlots.Size(); i++) {
+      if (camSlots[i]->Device()) {
+         camSlots[i]->StopDecrypting();
+         }
+      }
+}
+
 void cMtdHandler::CancelActivation(void)
 {
   for (int i = 0; i < camSlots.Size(); i++)
@@ -387,8 +396,6 @@ void cMtdCamSlot::StartDecrypting(void)
 void cMtdCamSlot::StopDecrypting(void)
 {
   cCamSlot::StopDecrypting();
-  if (!MasterSlot()->IsDecrypting())
-     MasterSlot()->StopDecrypting();
   cMutexLock MutexLock(&clearMutex);
   mtdMapper->Clear();
   mtdBuffer->Clear();
