@@ -443,6 +443,11 @@ uchar *cMtdCamSlot::Decrypt(uchar *Data, int &Count)
   return d;
 }
 
+bool cMtdCamSlot::TsPostProcess(uchar *Data)
+{
+  return MasterSlot()->TsPostProcess(Data);
+}
+
 void cMtdCamSlot::InjectEit(int Sid)
 {
   uint16_t UniqSid = CaPmtPackStatic() ? Sid : mtdMapper->RealToUniqSid(Sid); // PACK_CAPMT: no Sid mapping required

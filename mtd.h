@@ -188,6 +188,7 @@ public:
   virtual void StartDecrypting(void);
   virtual void StopDecrypting(void);
   virtual uchar *Decrypt(uchar *Data, int &Count);
+  virtual bool TsPostProcess(uchar *Data);
   virtual void InjectEit(int Sid);
   int PutData(const uchar *Data, int Count);
   int PutCat(const uchar *Data, int Count);

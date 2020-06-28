@@ -603,6 +603,7 @@ uint8_t cTPDU::Status(void)
 class cCiTransportConnection {
 private:
   enum eState { stIDLE, stCREATION, stACTIVE, stDELETION };
+  cMutex mutex;
   cCamSlot *camSlot;
   uint8_t tcid;
   eState state;
@@ -2090,6 +2091,7 @@ void cCiTransportConnection::SetTsPostProcessor(cCiSession *CiSession)
 
 bool cCiTransportConnection::TsPostProcess(uint8_t *TsPacket)
 {
+  cMutexLock MutexLock(&mutex);
   if (tsPostProcessor)
      return tsPostProcessor->TsPostProcess(TsPacket);
   return false;
