@@ -366,6 +366,7 @@ public:
   int ChannelsWrap;
   int ShowChannelNamesWithSource;
   int EmergencyExit;
+  int EnableCamTweaks;
   int __EndData__;
   cString InitialChannel;
   cString DeviceBondings;
