@@ -784,6 +784,7 @@ int main(int argc, char *argv[])
   KeyMacros.Load(AddDirectory(ConfigDirectory, "keymacros.conf"), true);
   Folders.Load(AddDirectory(ConfigDirectory, "folders.conf"));
   CamResponsesLoad(AddDirectory(ConfigDirectory, "camresponses.conf"), true);
+  CaModuleTweaks.Load(AddDirectory(ConfigDirectory, "camtweaks.conf"));
 
   if (!*cFont::GetFontFileName(Setup.FontOsd)) {
      const char *msg = "no fonts available - OSD will not show any text!";
@@ -1601,6 +1602,7 @@ Exit:
   signal(SIGALRM, SIG_DFL);
 
   StopSVDRPHandler();
+  CaModuleTweaks.Save();
   ChannelCamRelations.Save();
   cRecordControls::Shutdown();
   PluginManager.StopPlugins();
