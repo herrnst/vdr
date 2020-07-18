@@ -9,13 +9,13 @@
 
 #include "mtd.h"
 #include "receiver.h"
+#include "scapmt.h"
 
-//#define DEBUG_MTD
-#ifdef DEBUG_MTD
-#define DBGMTD(a...) dsyslog(a)
-#else
-#define DBGMTD(a...)
-#endif
+extern bool DebugCamtweaks; // set by camtweaks.conf
+extern bool DebugCamtweaksMtd; // set by camtweaks.conf
+
+#define DBGMTDMAP(a...) if (DebugCamtweaks) dsyslog(a)
+#define DBGMTD(a...) if (DebugCamtweaksMtd) dsyslog(a)
 
 //#define KEEPPIDS // for testing and debugging - USE ONLY IF YOU KNOW WHAT YOU ARE DOING!
 
@@ -26,13 +26,14 @@
 #else
 #define MAX_UNIQ_PIDS  256    // uniq PIDs are 8 bit (0x00 - 0xFF)
 #define UNIQ_PID_MASK  0x00FF
-#define UNIQ_PID_SHIFT 8
 #endif // KEEPPIDS
+#define UNIQ_PID_SHIFT 8
 
 // --- cMtdHandler -----------------------------------------------------------
 
 cMtdHandler::cMtdHandler(void)
 {
+  scaMapper = NULL;
 }
 
 cMtdHandler::~cMtdHandler()
@@ -53,17 +54,22 @@ cMtdCamSlot *cMtdHandler::GetMtdCamSlot(cCamSlot *MasterSlot)
       }
   dsyslog("CAM %d/%d: creating new MTD CAM slot", MasterSlot->SlotNumber(), camSlots.Size() + 1);
   cMtdCamSlot *s = new cMtdCamSlot(MasterSlot, camSlots.Size());
+  s->scaMapper = scaMapper;
   camSlots.Append(s);
   return s;
 }
 
-int cMtdHandler::Put(const uchar *Data, int Count)
+int cMtdHandler::Put(uchar *Data, int Count)
 {
   int Used = 0;
   while (Count >= TS_SIZE) {
         if (int Skipped = TS_SYNC(Data, Count))
            return Used + Skipped;
         int Pid = TsPid(Data);
+        if (scaMapper && SCAMAPPED(Pid)) {
+           Pid = scaMapper->UniqToRealPid(Pid);
+           TsSetPid(Data, Pid);
+           }
 #ifdef KEEPPIDS
         int Index = 0;
 #else
@@ -93,6 +99,64 @@ int cMtdHandler::Priority(void)
   return p;
 }
 
+bool cMtdHandler::CaProgramListActive(void)
+{
+  for (int i = 0; i < camSlots.Size(); i++) {
+      if (camSlots[i]->CaProgramListActive())
+         return true;
+      }
+  return false;
+}
+
+bool cMtdHandler::CaProgramListModified(void)
+{
+  for (int i = 0; i < camSlots.Size(); i++) {
+      if (camSlots[i]->CaProgramListModified())
+         return true;
+      }
+  return false;
+}
+
+int cMtdHandler::CamActiveProgsPrev(void)
+{ 
+  int actives = 0;
+  for (int i = 0; i < camSlots.Size(); i++)
+      actives += camSlots[i]->activeProgsPrev;
+  return actives;
+}
+
+int cMtdHandler::CamActiveProgs(void)
+{ 
+  int actives = 0;
+  for (int i = 0; i < camSlots.Size(); i++)
+      actives += camSlots[i]->activeProgs;
+  return actives;
+}
+
+int cMtdHandler::CamActivePids(void)
+{ 
+  int actives = 0;
+  for (int i = 0; i < camSlots.Size(); i++)
+      actives += camSlots[i]->activePids;
+  return actives;
+}
+
+void cMtdHandler::SendCaPmt(uint8_t CmdId, cCamSlot *MasterSlot, bool ResendPmt)
+{
+  cCiCaPmtList CaPmtList;
+  for (int i = 0; i < camSlots.Size(); i++) {
+      if (camSlots[i]->Device()) {
+         camSlots[i]->caplActive = MasterSlot->caplActive;
+         camSlots[i]->caplModified = MasterSlot->caplModified;
+
+         camSlots[i]->TriggerResendPmt(ResendPmt);
+         camSlots[i]->BuildCaPmts(CmdId, CaPmtList, camSlots[i]->MtdMapper());
+         camSlots[i]->TriggerResendPmt(false);
+         }
+      }
+  MasterSlot->SendCaPmts(CaPmtList);
+}
+
 bool cMtdHandler::IsDecrypting(void)
 {
   for (int i = 0; i < camSlots.Size(); i++) {
@@ -108,6 +172,7 @@ void cMtdHandler::StartDecrypting(void)
       if (camSlots[i]->Device()) {
          camSlots[i]->TriggerResendPmt();
          camSlots[i]->StartDecrypting();
+         camSlots[i]->TriggerResendPmt(false);
          }
       }
 }
@@ -157,6 +222,7 @@ private:
   int number;
   int masterCamSlotNumber;
   int nextUniqPid;
+  int numInvalidPids;
   uint16_t uniqPids[MAX_REAL_PIDS]; // maps a real PID to a unique PID
   uint16_t realPids[MAX_UNIQ_PIDS]; // maps a unique PID to a real PID
   cVector<uint16_t> uniqSids;
@@ -168,6 +234,8 @@ public:
   uint16_t UniqToRealPid(uint16_t UniqPid) { return realPids[UniqPid & UNIQ_PID_MASK]; }
   uint16_t RealToUniqSid(uint16_t RealSid);
   void Clear(void);
+  int Number(void) { return number; }
+  void CntInvalidPid(uint16_t Pid) { numInvalidPids++; }
   };
 
 cMtdMapper::cMtdMapper(int Number, int MasterCamSlotNumber)
@@ -175,6 +243,7 @@ cMtdMapper::cMtdMapper(int Number, int MasterCamSlotNumber)
   number = Number;
   masterCamSlotNumber = MasterCamSlotNumber;
   nextUniqPid = 0;
+  numInvalidPids = 0;
   Clear();
 }
 
@@ -223,6 +292,10 @@ uint16_t cMtdMapper::RealToUniqSid(uint16_t RealSid)
 
 void cMtdMapper::Clear(void)
 {
+  if (numInvalidPids) {
+     DBGMTDMAP("//////// MTD mapper status: skipped %d not remapable (old) TS packets", numInvalidPids);
+     numInvalidPids = 0;
+     }
   DBGMTD("CAM %d/%d: MTD mapper cleared", masterCamSlotNumber, number);
   memset(uniqPids, 0, sizeof(uniqPids));
   memset(realPids, MTD_INVALID_PID, sizeof(realPids));
@@ -236,11 +309,20 @@ void MtdMapSid(uchar *p, cMtdMapper *MtdMapper)
   uint16_t UniqSid = MtdMapper->RealToUniqSid(RealSid);
   p[0] = UniqSid >> 8;
   p[1] = UniqSid & 0xff;
+  DBGMTDMAP("------ %s: %u (%04X) -> %u (%04X)", __func__, RealSid, RealSid, UniqSid, UniqSid);
 }
 
 void MtdMapPid(uchar *p, cMtdMapper *MtdMapper)
 {
-  Poke13(p, MtdMapper->RealToUniqPid(Peek13(p)));
+  uint16_t RealPid = Peek13(p);
+  uint16_t UniqPid = MtdMapper->RealToUniqPid(RealPid);
+  Poke13(p, UniqPid);
+  DBGMTDMAP("------ %s: %d (%04X) -> %d (%04X)", __func__, RealPid, RealPid, UniqPid, UniqPid);
+}
+
+int MtdMapperNumber(cMtdMapper *MtdMapper)
+{
+  return MtdMapper->Number();
 }
 
 // --- cMtdCamSlot -----------------------------------------------------------
@@ -270,10 +352,22 @@ const int *cMtdCamSlot::GetCaSystemIds(void)
 
 void cMtdCamSlot::SendCaPmt(uint8_t CmdId)
 {
+  if (CaPmtPackMtd()) {
+     MasterSlot()->SendCaPmt(CmdId);
+     return;
+     }
   cMutexLock MutexLock(&mutex);
+  caplActive = CaProgramListActive();
+  caplModified = CaProgramListModified();
+
   cCiCaPmtList CaPmtList;
   BuildCaPmts(CmdId, CaPmtList, mtdMapper);
   MasterSlot()->SendCaPmts(CaPmtList);
+}
+
+uint32_t cMtdCamSlot::GetCamTweakFlags(void)
+{
+  return MasterSlot()->GetCamTweakFlags();
 }
 
 bool cMtdCamSlot::RepliesToQuery(void)
@@ -293,6 +387,7 @@ bool cMtdCamSlot::CanDecrypt(const cChannel *Channel, cMtdMapper *MtdMapper)
 
 void cMtdCamSlot::StartDecrypting(void)
 {
+  // !! this is ddci2 specific code !!
   MasterSlot()->StartDecrypting();
   cCamSlot::StartDecrypting();
 }
@@ -313,6 +408,10 @@ uchar *cMtdCamSlot::Decrypt(uchar *Data, int &Count)
      Count = TS_SIZE;
      int Pid = TsPid(Data);
      TsSetPid(Data, mtdMapper->RealToUniqPid(Pid));
+
+     if (scaMapper)
+        Data = scaMapper->TsPreProcess(Data, Count); // unwanted Pid: Data == NULL, Count == TS_SIZE
+
      MasterSlot()->Decrypt(Data, Count);
      if (Count == 0)
         TsSetPid(Data, Pid); // must restore PID for later retry
@@ -334,7 +433,14 @@ uchar *cMtdCamSlot::Decrypt(uchar *Data, int &Count)
         return NULL;
         }
      if (c >= TS_SIZE) {
-        TsSetPid(d, mtdMapper->UniqToRealPid(TsPid(d)));
+        uint16_t UniqPid = TsPid(d);
+        uint16_t RealPid = mtdMapper->UniqToRealPid(UniqPid);
+        if (RealPid != MTD_INVALID_PID)
+           TsSetPid(d, RealPid);
+        else {
+           d = NULL; // skip
+           mtdMapper->CntInvalidPid(UniqPid);
+           }
         delivered = true;
         }
      else
@@ -350,7 +456,9 @@ bool cMtdCamSlot::TsPostProcess(uchar *Data)
 
 void cMtdCamSlot::InjectEit(int Sid)
 {
-  MasterSlot()->InjectEit(mtdMapper->RealToUniqSid(Sid));
+  uint16_t UniqSid = CaPmtPackStatic() ? Sid : mtdMapper->RealToUniqSid(Sid); // PACK_CAPMT: no Sid mapping required
+  DBGMTDMAP("------ %s: %d (%04X) -> %d (%04X)", __func__, Sid, Sid, UniqSid, UniqSid);
+  MasterSlot()->InjectEit(UniqSid);
 }
 
 int cMtdCamSlot::PutData(const uchar *Data, int Count)
@@ -368,4 +476,14 @@ int cMtdCamSlot::PutCat(const uchar *Data, int Count)
 {
   MasterSlot()->Decrypt(const_cast<uchar *>(Data), Count);
   return Count;
+}
+
+int cMtdCamSlot::MtdNumber(void)
+{
+  return mtdMapper->Number();
+}
+
+int cMtdCamSlot::GetCaPmtSid(int Sid, int MtdNumber)
+{
+  return MasterSlot()->GetCaPmtSid(Sid, mtdMapper->Number());
 }

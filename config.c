@@ -497,6 +497,7 @@ cSetup::cSetup(void)
   ChannelsWrap = 0;
   ShowChannelNamesWithSource = 0;
   EmergencyExit = 1;
+  EnableCamTweaks = 0;
 }
 
 cSetup& cSetup::operator= (const cSetup &s)
@@ -726,6 +727,7 @@ bool cSetup::Parse(const char *Name, const char *Value)
   else if (!strcasecmp(Name, "ShowChannelNamesWithSource")) ShowChannelNamesWithSource = atoi(Value);
   else if (!strcasecmp(Name, "EmergencyExit"))       EmergencyExit      = atoi(Value);
   else if (!strcasecmp(Name, "LastReplayed"))        cReplayControl::SetRecording(Value);
+  else if (!strcasecmp(Name, "EnableCamTweaks"))     EnableCamTweaks = atoi(Value);
   else
      return false;
   return true;
@@ -858,6 +860,7 @@ bool cSetup::Save(void)
   Store("ShowChannelNamesWithSource", ShowChannelNamesWithSource);
   Store("EmergencyExit",      EmergencyExit);
   Store("LastReplayed",       cReplayControl::LastReplayed());
+  Store("EnableCamTweaks",    EnableCamTweaks);
 
   Sort();
 
