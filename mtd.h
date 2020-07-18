@@ -108,9 +108,12 @@ mapped in cCiCaPmt::MtdMapPids().
 #include "remux.h"
 #include "ringbuffer.h"
 
+class cScaMapper;
+
 class cMtdHandler {
 private:
   cVector<cMtdCamSlot *> camSlots;
+  cScaMapper *scaMapper;
 public:
   cMtdHandler(void);
       ///< Creates a new MTD handler that distributes TS data received through
@@ -121,13 +124,23 @@ public:
   cMtdCamSlot *GetMtdCamSlot(cCamSlot *MasterSlot);
       ///< Creates a new MTD CAM slot, or reuses an existing one that is currently
       ///< unused.
-  int Put(const uchar *Data, int Count);
+  int Put(uchar *Data, int Count);
       ///< Puts at most Count bytes of Data into the CAM slot which's index is
       ///< derived from the PID of the TS packets.
       ///< Data must point to the beginning of a TS packet.
       ///< Returns the number of bytes actually stored.
   int Priority(void);
       ///< Returns the maximum priority of any of the active MTD CAM slots.
+  bool CaProgramListActive(void);
+       /// Returns true if any of the MTD CAM slots caProgramList has active programs.
+  bool CaProgramListModified(void);
+       /// Returns true if any of the MTD CAM slots caProgramList has modified programs.
+  int CamActiveProgsPrev(void);
+  int CamActiveProgs(void);
+  int CamActivePids(void);
+      ///< Returns the number of active programs/pids of all MTD CAM slots.
+  void SendCaPmt(uint8_t CmdId, cCamSlot *MasterSlot, bool ResendPmt);
+       ///< Pack all MTD CAM slots and send the list of CA_PMTs to the CAM.
   bool IsDecrypting(void);
       ///< Returns true if any of the active MTD CAM slots is currently decrypting.
   void StartDecrypting(void);
@@ -144,14 +157,16 @@ public:
       ///< Returns true if the array is not empty.
   void UnAssignAll(void);
       ///< Unassigns all MTD CAM slots from their devices.
+  void SetScaMapper(cScaMapper *ScaMapper) { scaMapper = ScaMapper; }
   };
 
 #define MTD_DONT_CALL(v) dsyslog("PROGRAMMING ERROR (%s,%d): DON'T CALL %s", __FILE__, __LINE__, __FUNCTION__); return v;
 
 class cMtdMapper;
-
 void MtdMapSid(uchar *p, cMtdMapper *MtdMapper);
 void MtdMapPid(uchar *p, cMtdMapper *MtdMapper);
+
+int MtdMapperNumber(cMtdMapper *MtdMapper);
 
 class cMtdCamSlot : public cCamSlot {
 private:
@@ -162,6 +177,7 @@ private:
 protected:
   virtual const int *GetCaSystemIds(void);
   virtual void SendCaPmt(uint8_t CmdId);
+  virtual uint32_t GetCamTweakFlags(void);
 public:
   cMtdCamSlot(cCamSlot *MasterSlot, int Index);
        ///< Creates a new "Multi Transponder Decryption" CAM slot, connected to the
@@ -178,6 +194,8 @@ public:
   virtual void InjectEit(int Sid);
   int PutData(const uchar *Data, int Count);
   int PutCat(const uchar *Data, int Count);
+  virtual int MtdNumber(void);
+  virtual int GetCaPmtSid(int Sid, int MtdNumber = 0);
   // The following functions shall not be called for a cMtdCamSlot:
   virtual cCamSlot *Spawn(void) { MTD_DONT_CALL(NULL); }
   virtual bool Reset(void) { MTD_DONT_CALL(false); }
