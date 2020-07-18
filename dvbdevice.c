@@ -20,6 +20,7 @@
 #include "dvbci.h"
 #include "menuitems.h"
 #include "sourceparams.h"
+#include "scapmt.h"
 
 static int DvbApiVersion = 0x0000; // the version of the DVB driver actually in use (will be determined by the first device created)
 
@@ -2392,7 +2393,10 @@ bool cDvbDevice::GetTSPacket(uchar *&Data)
            Data = tsBuffer->Get(&Available, checkTsBuffer);
            if (!Data)
               Available = 0;
-           Data = cs->Decrypt(Data, Available);
+           if (ScaMapMasterSlot())
+              Data = cs->ScaMapDecrypt(Data, Available);
+           else
+              Data = cs->Decrypt(Data, Available);
            tsBuffer->Skip(Available);
            checkTsBuffer = Data != NULL;
            return true;

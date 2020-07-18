@@ -26,6 +26,7 @@
 #include "libsi/si.h"
 #include "skins.h"
 #include "tools.h"
+#include "scapmt.h"
 
 // Set these to 'true' for debug output:
 static bool DumpTPDUDataTransfer = false;
@@ -34,6 +35,11 @@ static bool DumpPolls = false;
 static bool DumpDateTime = false;
 
 #define dbgprotocol(a...) if (DebugProtocol) fprintf(stderr, a)
+
+bool DebugCamtweaks = false; // set by camtweaks.conf
+bool DebugCamtweaksMtd = false; // set by camtweaks.conf
+
+#define DBGCAPMT(a...) if (DebugCamtweaks) dsyslog(a)
 
 // --- Helper functions ------------------------------------------------------
 
@@ -185,6 +191,7 @@ void cCaPidReceiver::Receive(const uchar *Data, int Length)
 {
   if (TsPid(Data) == CATPID) {
      cMtdCamSlot *MtdCamSlot = dynamic_cast<cMtdCamSlot *>(Device()->CamSlot());
+     cScaMapper *ScaMapper = Device()->ScaMapper();
      const uchar *p = NULL;
      if (TsPayloadStart(Data)) {
         if (Data[5] == SI::TableIdCAT) {
@@ -207,7 +214,7 @@ void cCaPidReceiver::Receive(const uchar *Data, int Length)
                     else {
                        p = Data + 5; // no need to copy the data
                        }
-                    if (MtdCamSlot) {
+                    if (MtdCamSlot || ScaMapper) {
                        mtdNumCatPackets = 0;
                        memcpy(mtdCatBuffer[mtdNumCatPackets++], Data, TS_SIZE);
                        }
@@ -216,9 +223,13 @@ void cCaPidReceiver::Receive(const uchar *Data, int Length)
                     dsyslog("multi table CAT section - unhandled!");
                  catVersion = v;
                  }
-              else if (MtdCamSlot) {
-                 for (int i = 0; i < mtdNumCatPackets; i++)
-                     MtdCamSlot->PutCat(mtdCatBuffer[i], TS_SIZE);
+              else if (MtdCamSlot || ScaMapper) {
+                 for (int i = 0; i < mtdNumCatPackets; i++) {
+                     if (MtdCamSlot)
+                        MtdCamSlot->PutCat(mtdCatBuffer[i], TS_SIZE);
+                     else
+                        Device()->CamSlot()->Inject(mtdCatBuffer[i], TS_SIZE); // use 'Inject' as the ddci2 'Decrypt' function is not thread-save
+                     }
                  }
               }
            }
@@ -233,7 +244,7 @@ void cCaPidReceiver::Receive(const uchar *Data, int Length)
               p = buffer;
               length = bufp - buffer;
               }
-           if (MtdCamSlot)
+           if (MtdCamSlot || ScaMapper)
               memcpy(mtdCatBuffer[mtdNumCatPackets++], Data, TS_SIZE);
            }
         else {
@@ -252,19 +263,23 @@ void cCaPidReceiver::Receive(const uchar *Data, int Length)
                   AddEmmPid(EmmPid);
                   if (MtdCamSlot)
                      MtdMapPid(const_cast<uchar *>(p + i + 4), MtdCamSlot->MtdMapper());
+                  if (ScaMapper)
+                     Poke13(const_cast<uchar *>(p + i + 4), ScaMapper->RealToUniqPid(Peek13(p + i + 4)));
                   switch (CaId >> 8) {
                     case 0x01: for (int j = i + 7; j < i + p[i + 1] + 2; j += 4) {
                                    EmmPid = Peek13(p + j);
                                    AddEmmPid(EmmPid);
                                    if (MtdCamSlot)
                                       MtdMapPid(const_cast<uchar *>(p + j), MtdCamSlot->MtdMapper());
+                                   if (ScaMapper)
+                                      Poke13(const_cast<uchar *>(p + j), ScaMapper->RealToUniqPid(Peek13(p + j)));
                                    }
                                break;
                     }
                   i += p[i + 1] + 2 - 1; // -1 to compensate for the loop increment
                   }
                }
-           if (MtdCamSlot) {
+           if (MtdCamSlot || ScaMapper) {
               // update crc32
               uint32_t crc = SI::CRC32::crc32((const char *)p, length - 4, 0xFFFFFFFF); // <TableIdCAT....>[crc32]
               uchar *c = const_cast<uchar *>(p + length - 4);
@@ -279,7 +294,10 @@ void cCaPidReceiver::Receive(const uchar *Data, int Length)
                   memcpy(mtdCatBuffer[i] + j, t, n);
                   t += n;
                   length -= n;
-                  MtdCamSlot->PutCat(mtdCatBuffer[i], TS_SIZE);
+                  if (MtdCamSlot)
+                     MtdCamSlot->PutCat(mtdCatBuffer[i], TS_SIZE);
+                  else
+                     Device()->CamSlot()->Inject(mtdCatBuffer[i], TS_SIZE);
                   }
               }
            }
@@ -618,6 +636,9 @@ private:
   bool createConnectionRequested;
   bool deleteConnectionRequested;
   bool hasUserIO;
+  cMutex sendTpduMutex;
+  cMutex sendDataMutex;
+  cTimeMs sendTimer;
   cTimeMs alive;
   cTimeMs timer;
   cCiSession *sessions[MAX_SESSIONS_PER_TC + 1]; // session numbering starts with 1
@@ -912,6 +933,23 @@ bool cCiApplicationInformation::EnterMenu(void)
   return false;
 }
 
+// --- CamTweaks ---
+
+#define CAMTWEAK_ENABLED   0x1
+#define CAMTWEAK_FORCE_MCD 0x2
+#define CAMTWEAK_AVOID_MTD 0x4
+
+#define CAMTWEAK_PACK_MCD  0x10
+#define CAMTWEAK_PACK_MTD  0x20
+#define CAMTWEAK_STATIC_CAPMT 0x40
+
+#define CAMTWEAK_DESELECT  0x800
+#define CAMTWEAK_DEBUG     0x1000
+#define CAMTWEAK_DBGMTD    0x2000
+
+#define CAMTWEAK_PACK_CAPMT (CAMTWEAK_PACK_MCD | CAMTWEAK_PACK_MTD)
+#define CAMTWEAK_OPTS_CAPMT (CAMTWEAK_PACK_CAPMT | CAMTWEAK_STATIC_CAPMT | CAMTWEAK_DESELECT)
+
 // --- cCiCaPmt --------------------------------------------------------------
 
 #define MAXCASYSTEMIDS 64
@@ -943,22 +981,41 @@ private:
   int transponder;
   int programNumber;
   int caSystemIds[MAXCASYSTEMIDS + 1]; // list is zero terminated!
+  uint32_t camTweaks;
+  uint8_t programCmdId;
+  int esInfoPos;
   void AddCaDescriptors(int Length, const uint8_t *Data);
 public:
-  cCiCaPmt(uint8_t CmdId, int Source, int Transponder, int ProgramNumber, const int *CaSystemIds);
+  cCiCaPmt(uint8_t CmdId, int Source, int Transponder, int ProgramNumber, const int *CaSystemIds, uint32_t CamTweaks = 0);
   uint8_t CmdId(void) { return cmdId; }
   void SetListManagement(uint8_t ListManagement);
   uint8_t ListManagement(void) { return capmt.Get(0); }
+
+  void UseCmdId(uint8_t CmdId) { cmdId = CmdId; }
+  void UseSourceTransponder(int Source, int Transponder) { source = Source; transponder = Transponder; };
+  void UseProgramNumber(int ProgramNumber) { programNumber = ProgramNumber; };
+  uint8_t ProgramCmdId(void) { return programCmdId; }
+  void SetSid(uint16_t Sid);
+  uint16_t GetSid(void) { return capmt.Get(1) << 8 | capmt.Get(2); }
+
   void AddPid(int Pid, uint8_t StreamType);
+  void AddStaticPids(cVector<uint32_t> &VscaConf, cScaMapper *ScaMapper);
   void MtdMapPids(cMtdMapper *MtdMapper);
+  void MtdMapEsPids(cMtdMapper *MtdMapper);
+
+  cDynamicBuffer *CaPmt(void) { return &capmt; }
+  void DumpCaPmt(void);
   };
 
-cCiCaPmt::cCiCaPmt(uint8_t CmdId, int Source, int Transponder, int ProgramNumber, const int *CaSystemIds)
+cCiCaPmt::cCiCaPmt(uint8_t CmdId, int Source, int Transponder, int ProgramNumber, const int *CaSystemIds, uint32_t CamTweaks)
 {
   cmdId = CmdId;
   source = Source;
   transponder = Transponder;
   programNumber = ProgramNumber;
+  camTweaks = CamTweaks;
+  programCmdId = CmdId;
+  esInfoPos = 0;
   int i = 0;
   if (CaSystemIds) {
      for (; CaSystemIds[i]; i++)
@@ -973,7 +1030,9 @@ cCiCaPmt::cCiCaPmt(uint8_t CmdId, int Source, int Transponder, int ProgramNumber
   esInfoLengthPos = capmt.Length();
   capmt.Append(0x00); // program_info_length H (at program level)
   capmt.Append(0x00); // program_info_length L
-  AddCaDescriptors(caDescriptors.Length(), caDescriptors.Data());
+
+  int cadLen = (camTweaks & CAMTWEAK_PACK_CAPMT) ? 0 : caDescriptors.Length();
+  AddCaDescriptors(cadLen, caDescriptors.Data());
 }
 
 void cCiCaPmt::SetListManagement(uint8_t ListManagement)
@@ -981,10 +1040,22 @@ void cCiCaPmt::SetListManagement(uint8_t ListManagement)
   capmt.Set(0, ListManagement);
 }
 
+void cCiCaPmt::SetSid(uint16_t Sid)
+{
+  capmt.Set(1, (Sid >> 8) & 0xFF);
+  capmt.Set(2,  Sid       & 0xFF);
+}
+
 void cCiCaPmt::AddPid(int Pid, uint8_t StreamType)
 {
   if (Pid) {
+     caDescriptors.Clear(); // should go into cCaDescriptorHandler::GetCaDescriptors()
      GetCaDescriptors(source, transponder, programNumber, caSystemIds, caDescriptors, Pid);
+
+     if (!caDescriptors.Length() && (camTweaks & CAMTWEAK_PACK_CAPMT))
+        GetCaDescriptors(source, transponder, programNumber, caSystemIds, caDescriptors, 0);
+     if (!esInfoPos)
+        esInfoPos = capmt.Length();
      capmt.Append(StreamType);
      capmt.Append((Pid >> 8) & 0xFF);
      capmt.Append( Pid       & 0xFF);
@@ -1009,6 +1080,41 @@ void cCiCaPmt::AddCaDescriptors(int Length, const uint8_t *Data)
      }
   else
      esyslog("ERROR: adding CA descriptor without Pid!");
+}
+
+void cCiCaPmt::AddStaticPids(cVector<uint32_t> &VscaConf, cScaMapper *ScaMapper)
+{
+  uint8_t StreamType = 6; // 6: STREAMTYPE_13818_PES_PRIVATE
+  uint8_t caDescriptor[6];
+
+  int s = 0;
+  for (int n = 0; n < VscaConf.Size(); n++) {
+      uint32_t sca = VscaConf[n];
+      int caId = (sca >> 16) & 0xFFFF;
+      int sids = (sca >>  8) & 0xFF;
+      int pids = (sca      ) & 0xFF;
+
+      caDescriptor[0] = SI::CaDescriptorTag;
+      caDescriptor[1] = 4;
+      caDescriptor[2] = (caId >> 8) & 0xFF;
+      caDescriptor[3] =  caId       & 0xFF;
+
+      for (int i = 0; i < sids; i++, s++) {
+          int Ecm = ScaMapper->UniqCaPid(s, 0);
+          caDescriptor[4] = (Ecm >> 8) & 0xFF;
+          caDescriptor[5] =  Ecm       & 0xFF;
+          for (int j = 1; j <= pids; j++) {
+              int Pid = ScaMapper->UniqCaPid(s, j);
+              capmt.Append(StreamType);
+              capmt.Append((Pid >> 8) & 0xFF);
+              capmt.Append( Pid       & 0xFF);
+              esInfoLengthPos = capmt.Length();
+              capmt.Append(0x00); // ES_info_length H (at ES level)
+              capmt.Append(0x00); // ES_info_length L
+              AddCaDescriptors(sizeof(caDescriptor), caDescriptor);
+              }
+          }
+      }
 }
 
 static int MtdMapCaDescriptor(uchar *p, cMtdMapper *MtdMapper)
@@ -1070,12 +1176,23 @@ static int MtdMapStreams(uchar *p, cMtdMapper *MtdMapper, int Length)
   return Length;
 }
 
+void cCiCaPmt::MtdMapEsPids(cMtdMapper *MtdMapper)
+{
+  if (esInfoPos) {
+     uchar *p = capmt.Data() + esInfoPos;
+     int m = capmt.Length() - esInfoPos;
+     MtdMapStreams(p, MtdMapper, m);
+     esInfoPos = 0;
+     }
+}
+
 void cCiCaPmt::MtdMapPids(cMtdMapper *MtdMapper)
 {
   uchar *p = capmt.Data();
   int m = capmt.Length();
   if (m >= 3) {
-     MtdMapSid(p + 1, MtdMapper);
+     if (!(camTweaks & CAMTWEAK_PACK_CAPMT)) // PACK_CAPMT: no Sid mapping required
+        MtdMapSid(p + 1, MtdMapper);
      p += 4;
      m -= 4;
      if (m >= 2) {
@@ -1086,6 +1203,63 @@ void cCiCaPmt::MtdMapPids(cMtdMapper *MtdMapper)
            MtdMapStreams(p, MtdMapper, m);
            }
         }
+     }
+}
+
+//------ DUMP CAPMT
+
+static int DumpCaDescriptors(uchar *p, char *s)
+{
+  int Length = p[0] * 256 + p[1];
+  if (Length >= 1) {
+     uint8_t CmdId = p[2];
+     s += sprintf(s, "{%d}", CmdId);
+     p += 3;
+     int m = Length - 1;
+     for (int l = m; m > 0 && *p == SI::CaDescriptorTag; m -= l, p += l) {
+         l = p[1] + 2;
+         if (l >= 6) {
+            uint16_t caid = p[2] << 8 | p[3];
+            uint16_t ecm = Peek13(p + 4);
+            s += sprintf(s, "<%d(%X)/%d(%X)>", caid, caid, ecm, ecm);
+            }
+         else
+            break;
+         }
+     }
+  return Length + 2;
+}
+
+static int DumpStreams(uchar *p, int Length, char *q)
+{
+  char *s = q + strlen(q);
+  int m = Length;
+  for (int l = 0; m >= 5; m -= l, p += l) {
+      uint16_t Pid = Peek13(p + 1);
+      s += sprintf(s, " ES:%d(%X)", Pid, Pid);
+
+      l = 3 + DumpCaDescriptors(p + 3, s);
+      s += strlen(s);
+      }
+  return Length;
+}
+
+void cCiCaPmt::DumpCaPmt(void)
+{
+  char info[4000] = { 0 };
+  uchar *p = capmt.Data();
+  int m = capmt.Length();
+  if (m >= 3) {
+     char *q = info;
+     uint8_t Lm = capmt.Get(0);
+     uint16_t Sid = GetSid();
+     q += sprintf(q, "[%d] PL:%d(%X)", Lm, Sid, Sid);
+
+     if (m >= 6) {
+        int l = 4 + DumpCaDescriptors(p + 4, q);
+        DumpStreams(p + l, m - l, q);
+        }
+     dsyslog("%s", info);
      }
 }
 
@@ -1115,11 +1289,13 @@ private:
   bool repliesToQuery;
   cTimeMs timer;
   int numRetries;
+  bool applyCamTweaks;
 public:
   cCiConditionalAccessSupport(uint16_t SessionId, cCiTransportConnection *Tc);
   virtual void Process(int Length = 0, const uint8_t *Data = NULL);
   const int *GetCaSystemIds(void) { return caSystemIds; }
   void SendPMT(cCiCaPmt *CaPmt);
+  bool ApplyCamTweaks(void); /// CA Module tweaking
   bool RepliesToQuery(void) { return repliesToQuery; }
   bool Ready(void) { return state >= 4; }
   bool ReceivedReply(void) { return state >= 5; }
@@ -1134,6 +1310,7 @@ cCiConditionalAccessSupport::cCiConditionalAccessSupport(uint16_t SessionId, cCi
   caSystemIds[numCaSystemIds = 0] = 0;
   repliesToQuery = false;
   numRetries = 0;
+  applyCamTweaks = Setup.EnableCamTweaks;
 }
 
 void cCiConditionalAccessSupport::Process(int Length, const uint8_t *Data)
@@ -1166,6 +1343,10 @@ void cCiConditionalAccessSupport::Process(int Length, const uint8_t *Data)
                timer.Set(0);
                numRetries = QUERY_RETRIES;
                state = 2; // got ca info
+               if (numCaSystemIds == 1 && caSystemIds[0] == 0xFFFF) { // dvbapi 'wildcard' CAID
+                  dsyslog("CAM %d: virtual CAM detected", CamSlot()->SlotNumber());
+                  applyCamTweaks = false;
+                  }
                }
             dsyslog("CAM %d: system ids:%s", CamSlot()->SlotNumber(), *Ids ? *Ids : " none");
             }
@@ -1239,8 +1420,19 @@ void cCiConditionalAccessSupport::Process(int Length, const uint8_t *Data)
      SendData(AOT_CA_INFO_ENQ);
      state = 1; // enquired ca info
      }
-  else if ((state == 2 || state == 3) && timer.TimedOut()) {
-     if (numRetries-- > 0) {
+  else if (!applyCamTweaks && (state == 2 || state == 3) && timer.TimedOut()) {
+     if (CamSlot()->McdForced()) {
+        if (CamSlot()->IsMasterSlot())
+           dsyslog("CAM %d: multi channel decryption (MCD) forced by Setup!", CamSlot()->SlotNumber());
+        if (CamSlot()->MtdAvailable()) {
+           bool use_mtd = !(CamSlot()->GetCamTweakFlags() & CAMTWEAK_AVOID_MTD);
+           if (CamSlot()->IsMasterSlot())
+              dsyslog("CAM %d: supports multi transponder decryption (MTD) %s", CamSlot()->SlotNumber(), use_mtd ? "" : "! disabled by Setup !");
+           CamSlot()->MtdActivate(use_mtd);
+           }
+        state = 4; // normal operation
+        }
+     else if (numRetries-- > 0) {
         cCiCaPmt CaPmt(CPCI_QUERY, 0, 0, 0, NULL);
         SendPMT(&CaPmt);
         timer.Set(QUERY_WAIT_TIME);
@@ -1252,15 +1444,104 @@ void cCiConditionalAccessSupport::Process(int Length, const uint8_t *Data)
         state = 4; // normal operation
         }
      }
+  else if (applyCamTweaks && state == 2) { // configure MCD/MTD
+     applyCamTweaks = !ApplyCamTweaks();
+     }
 }
 
 void cCiConditionalAccessSupport::SendPMT(cCiCaPmt *CaPmt)
 {
   if (CaPmt && state >= 2) {
+     CamSlot()->CaPmtTracker(CaPmt);
      dbgprotocol("Slot %d: ==> Ca Pmt (%d) %d %d\n", CamSlot()->SlotNumber(), SessionId(), CaPmt->ListManagement(), CaPmt->CmdId());
      SendData(AOT_CA_PMT, CaPmt->capmt.Length(), CaPmt->capmt.Data());
      state = 4; // sent ca pmt
      }
+}
+
+// --- CamTweaks ---
+
+bool cCiConditionalAccessSupport::ApplyCamTweaks(void)
+{
+  cCiApplicationInformation *ai = (cCiApplicationInformation *)CamSlot()->GetSessionByResourceId(RI_APPLICATION_INFORMATION);
+  if (!ai || !ai->GetMenuString()) {
+     esyslog("CAM %d: wait for ApplicationInformtion", CamSlot()->SlotNumber());
+     return false;
+     }
+
+  // search ca-module in configfile
+  cCaModuleTweak *cmt = CaModuleTweaks.GetEntry(ai->GetApplicationManufacturer(), ai->GetManufacturerCode(), ai->GetMenuString());
+  if (!cmt) // add it to the configfile, untweaked
+     cmt = CaModuleTweaks.AddEntry(ai->GetApplicationManufacturer(), ai->GetManufacturerCode(), ai->GetMenuString(), 0x0, 0, NULL);
+  /// assign the tweaks to the camslot only if they are enabled in setup AND flags
+  bool enabled = (Setup.EnableCamTweaks && cmt->CamFlags() & CAMTWEAK_ENABLED);
+  uint32_t Flags = enabled ? cmt->CamFlags() : 0x0;
+  int Limit = enabled ? cmt->McdLimit() : 0;
+
+  if (Flags & CAMTWEAK_FORCE_MCD) {
+     if (Flags & CAMTWEAK_STATIC_CAPMT)
+        Flags &= ~CAMTWEAK_PACK_CAPMT;
+     else if (Flags & CAMTWEAK_PACK_CAPMT) {
+        uint32_t f = Flags;
+        Flags &= ~CAMTWEAK_PACK_CAPMT;
+        Flags |= (f & CAMTWEAK_PACK_MTD) ? CAMTWEAK_PACK_MTD : CAMTWEAK_PACK_MCD;
+        }
+     }
+  else
+     Flags &= ~(CAMTWEAK_PACK_CAPMT | CAMTWEAK_STATIC_CAPMT);
+
+  // enable debuging
+  DebugCamtweaks    = Flags & CAMTWEAK_DEBUG;
+  DebugCamtweaksMtd = Flags & CAMTWEAK_DBGMTD;
+
+  // parse static CaIds
+  if (Flags & CAMTWEAK_STATIC_CAPMT) {
+     cVector<uint32_t> &vScaConf = cmt->VscaConf();
+     cVector<int> caIds;
+
+     for (int i = 0; i < vScaConf.Size(); i++) {
+         int caId = (vScaConf[i] >> 16) & 0xFFFF;
+         if (!caId)
+            continue;
+         bool found = false;
+         for (int n = 0; n < numCaSystemIds && !found; n++)
+             found = caSystemIds[n] == caId;
+         if (found)
+            caIds.AppendUnique(caId);
+         else
+            esyslog("CAM %d: static CaId %04X not in CA_INFO", CamSlot()->SlotNumber(), caId);
+         }
+     if (caIds.Size()) { // reduce caSystemIds
+        int n = 0;
+        for (; n < caIds.Size(); n++)
+            caSystemIds[n] = caIds[n];
+        caSystemIds[n] = 0; // zero terminated
+        numCaSystemIds = n;
+     }
+     else {
+        esyslog("CAM %d: no usable static CaId given - STATIC_CAPMT disabled", CamSlot()->SlotNumber());
+        Flags &= ~CAMTWEAK_STATIC_CAPMT;
+        }
+     }
+  //
+  CamSlot()->SetCamTweakFlags(Flags);
+
+  if (Flags & CAMTWEAK_STATIC_CAPMT)
+     Limit = CamSlot()->InitStaticCaPmt(cmt->VscaConf());
+  CamSlot()->SetCamTweakMcdLimit(Limit);
+
+  if (Setup.EnableCamTweaks)
+     dsyslog("CAM %d: Tweaks [%s]: Flags: 0x%X, Limit: %d (%s%s%s%s%s)", CamSlot()->SlotNumber(),
+                      cmt->CamFlags() & CAMTWEAK_ENABLED ? "enabled" : "disabled", cmt->CamFlags(), Limit,
+                      (Flags & CAMTWEAK_PACK_MTD) ? "PACK MCD/MTD":
+                      (Flags & CAMTWEAK_PACK_MCD) ? "PACK MCD":
+                      (Flags & CAMTWEAK_FORCE_MCD) ? "MCD" : "",
+
+                      (Flags & CAMTWEAK_STATIC_CAPMT) ? " STATIC": "",
+                      (Flags & CAMTWEAK_DESELECT) ? " DESELECT" : "",
+                      (Flags & CAMTWEAK_DEBUG) ? " DEBUG" : "",
+                      (Flags & CAMTWEAK_DBGMTD) ? " DBGMTD" : "");
+  return true;
 }
 
 // --- cCiHostControl --------------------------------------------------------
@@ -1854,15 +2135,30 @@ const char *cCiTransportConnection::GetCamName(void)
   return ai ? ai->GetMenuString() : NULL;
 }
 
+#define TC_MIN_REMAIN       5 // ms
+#define TC_TPDU_INTERVAL    0 // ms - min. interval for processing TPDUs
+#define TC_CAPMT_INTERVAL 300 // ms - min. interval for processing CA_PMT objects
+
 void cCiTransportConnection::SendTPDU(uint8_t Tag, int Length, const uint8_t *Data)
 {
+  cMutexLock MutexLock(&sendTpduMutex); // may be accessed from different threads
   cTPDU TPDU(camSlot->SlotIndex(), tcid, Tag, Length, Data);
+  int remain = -(int)sendTimer.Elapsed(); // remain is a negtive value
+  int aoTag = Length ? Data[4] << 16 | Data[5] << 8 | Data[6] : 0;
+  if (aoTag)
+     DBGCAPMT("+++++++ SendData Tag: %06X (L:%d.)", aoTag, Length);
+  if (remain >= TC_MIN_REMAIN) {
+     DBGCAPMT("======= SendTPDU Tag: %02X (L:%d.) ==> remain %d ms", Tag, Length, remain);
+     cCondWait::SleepMs(remain);
+     }
   camSlot->Write(&TPDU);
   timer.Set(TC_POLL_TIMEOUT);
+  sendTimer.Set(aoTag == AOT_CA_PMT ? TC_CAPMT_INTERVAL : TC_TPDU_INTERVAL); // Workaround to give some CAMs more time to handle CA_PMTs
 }
 
 void cCiTransportConnection::SendData(int Length, const uint8_t *Data)
 {
+  cMutexLock MutexLock(&sendDataMutex); // may be accessed from different threads
   // if Length ever exceeds MAX_TPDU_DATA this needs to be handled differently
   if (state == stACTIVE && Length > 0)
      SendTPDU(T_DATA_LAST, Length, Data);
@@ -2188,6 +2484,18 @@ cCamSlot::cCamSlot(cCiAdapter *CiAdapter, bool WantsTsData, cCamSlot *MasterSlot
   lastModuleStatus = msReset; // avoids initial reset log message
   resetTime = 0;
   resendPmt = false;
+
+  camTweakFlags = 0x0;  // set in MasterSlot by cCiConditionalAccessSupport
+  camTweakMcdLimit = 0;
+
+  activeProgsPrev = 0;
+  activeProgs = 0;
+  activePids = 0;
+  caplActive = false;
+  caplModified = false;
+
+  scaMapper = NULL;
+
   for (int i = 0; i <= MAX_CONNECTIONS_PER_CAM_SLOT; i++) // tc[0] is not used, but initialized anyway
       tc[i] = NULL;
   if (MasterSlot)
@@ -2208,6 +2516,8 @@ cCamSlot::~cCamSlot()
   CamSlots.Del(this, false);
   DeleteAllConnections();
   delete mtdHandler;
+  if (!masterSlot)
+     delete scaMapper;
 }
 
 cCamSlot *cCamSlot::MtdSpawn(void)
@@ -2347,12 +2657,21 @@ void cCamSlot::Process(cTPDU *TPDU)
      moduleCheckTimer.Set(MODULE_CHECK_INTERVAL);
      }
   if (resendPmt && Ready()) {
+     ResetCaPmtTracker();
+     DBGCAPMT("CAM %d/%d: resend ProgramList", slotNumber, MtdNumber());
      if (mtdHandler) {
-        mtdHandler->StartDecrypting();
-        resendPmt = false;
+        if (!CaPmtPack())
+           mtdHandler->StartDecrypting();
+        else {
+           // !! this is ddci2 specific code !!
+           // No forewarding to the base class cCamSlot::StartDecrypting() by ddci2 in MTD mode
+           StartDecrypting();
+           cCamSlot::StartDecrypting();
+           }
         }
      else if (caProgramList.Count())
         StartDecrypting();
+     resendPmt = false;
      }
   processed.Broadcast();
 }
@@ -2504,9 +2823,9 @@ cCiCaPmtList::~cCiCaPmtList()
       delete caPmts[i];
 }
 
-cCiCaPmt *cCiCaPmtList::Add(uint8_t CmdId, int Source, int Transponder, int ProgramNumber, const int *CaSystemIds)
+cCiCaPmt *cCiCaPmtList::Add(uint8_t CmdId, int Source, int Transponder, int ProgramNumber, const int *CaSystemIds, uint32_t CamTweaks)
 {
-  cCiCaPmt *p = new cCiCaPmt(CmdId, Source, Transponder, ProgramNumber, CaSystemIds);
+  cCiCaPmt *p = new cCiCaPmt(CmdId, Source, Transponder, ProgramNumber, CaSystemIds, CamTweaks);
   caPmts.Append(p);
   return p;
 }
@@ -2517,6 +2836,11 @@ void cCiCaPmtList::Del(cCiCaPmt *CaPmt)
      delete CaPmt;
 }
 
+cDynamicBuffer *cCiCaPmtList::CaPmt(int Index)
+{
+  return caPmts[Index]->CaPmt();
+}
+
 bool cCamSlot::RepliesToQuery(void)
 {
   cMutexLock MutexLock(&mutex);
@@ -2524,21 +2848,164 @@ bool cCamSlot::RepliesToQuery(void)
   return cas && cas->RepliesToQuery();
 }
 
+bool cCamSlot::McdForced(void)
+{
+  return GetCamTweakFlags() & CAMTWEAK_FORCE_MCD;
+}
+
+uint32_t cCamSlot::CaPmtPackStatic(void)
+{
+  return GetCamTweakFlags() & (CAMTWEAK_PACK_CAPMT | CAMTWEAK_STATIC_CAPMT);
+}
+
+uint32_t cCamSlot::CaPmtPack(void)
+{
+  return GetCamTweakFlags() & CAMTWEAK_PACK_CAPMT;
+}
+
+bool cCamSlot::CaPmtPackMtd(void)
+{
+  return GetCamTweakFlags() & CAMTWEAK_PACK_MTD;
+}
+
+bool cCamSlot::CaPmtStatic(void)
+{
+  return GetCamTweakFlags() & CAMTWEAK_STATIC_CAPMT;
+}
+
+///----- CAM serviceList Tracker -----
+
+void cCamSlot::ResetCaPmtTracker()
+{
+  serviceSlots.Clear();
+  serviceSlotCmdIds.Clear();
+  serviceSlotActives.Clear();
+}
+
+void cCamSlot::CaPmtTracker(cCiCaPmt *CaPmt)
+{
+  char svc[1000] = { 0 };
+  char *q = svc;
+  if (DebugCamtweaks)
+     CaPmt->DumpCaPmt();
+
+  uint8_t Lm = CaPmt->ListManagement();
+  uint16_t Sid = CaPmt->GetSid();
+  uint8_t CmdId = CaPmt->CmdId();
+
+  if (Lm == CPLM_ONLY || Lm == CPLM_FIRST)
+     ResetCaPmtTracker();
+  if (Sid) { // Is 0 a valid service number ?
+     int i = serviceSlots.IndexOf(Sid);
+     if (i < 0) {
+        serviceSlots.Append(Sid);
+        serviceSlotCmdIds.Append(CmdId);
+        }
+     else
+        serviceSlotCmdIds[i] = CmdId; // update
+
+     serviceSlotActives.Clear();
+     for (i = 0; i < serviceSlots.Size(); i++) {
+         q += sprintf(q, " [%d:%d(%04X){%d}]", i+1, serviceSlots[i], serviceSlots[i], serviceSlotCmdIds[i]);
+         if (serviceSlotCmdIds[i] != CPCI_NOT_SELECTED)
+            serviceSlotActives.Append(serviceSlots[i]);
+         }
+     }
+  DBGCAPMT("----- %s: Service <%d/%d>: %s", __func__, serviceSlotActives.Size(), serviceSlots.Size(), svc);
+}
+
+int cCamSlot::NumCamServices(void)
+{
+  return serviceSlots.Size();
+}
+
+bool cCamSlot::IsCamService(uint16_t Sid)
+{
+  return serviceSlots.IndexOf(Sid) >= 0;
+}
+
+///-----
+
+int cCamSlot::GetCaPmtSid(int Sid, int MtdNumber)
+{
+  uint32_t caPmtPack = CaPmtPackStatic();
+  return ((!caPmtPack) ? Sid : SlotNumber() * 1000) + (caPmtPack & CAMTWEAK_PACK_MCD ? MtdNumber : 0);
+}
+
+const char *ListMMs[6] = { "CPLM_MORE", "CPLM_FIRST", "CPLM_LAST", "CPLM_ONLY", "CPLM_ADD", "CPLM_UPDATE" };
+const char *CmdIds[5] = { "undef", "ok_descrambling", "ok_mmi", "query", "not_selected" };
+
+int cCamSlot::InitStaticCaPmt(cVector<uint32_t> &VscaConf)
+{
+  if (!IsMasterSlot())
+     return 0;
+  delete scaMapper; // create new
+  scaMapper = new cScaMapper(VscaConf, this);
+  return scaMapper->NumSids();
+}
+
+bool cCamSlot::SendStaticCaPmt(cVector<uint32_t> &VscaConf)
+{
+  if (!scaMapper)
+     return false;
+  int Sid = 1; // any
+  cCiCaPmtList CaPmtList;
+  // prepare a packed CAPMT
+  cCiCaPmt *CaPmt = CaPmtList.Add(CPCI_OK_DESCRAMBLING, 0, 0, Sid, NULL, CAMTWEAK_PACK_MTD);
+  CaPmt->AddStaticPids(VscaConf, scaMapper);
+  CaPmt->SetSid(GetCaPmtSid(Sid));
+  cCiConditionalAccessSupport *cas = (cCiConditionalAccessSupport *)GetSessionByResourceId(RI_CONDITIONAL_ACCESS_SUPPORT);
+  if (cas)
+     cas->SendPMT(CaPmtList.caPmts[0]);
+  return cas != NULL;
+}
+
 void cCamSlot::BuildCaPmts(uint8_t CmdId, cCiCaPmtList &CaPmtList, cMtdMapper *MtdMapper)
 {
   cMutexLock MutexLock(&mutex);
-  CaPmtList.caPmts.Clear();
+
+  uint32_t caPmtOpts = GetCamTweakFlags() & CAMTWEAK_OPTS_CAPMT;
+  uint32_t caPmtPack = CaPmtPack();
+
+  cCiCaPmt *CaPmt = ((caPmtPack & CAMTWEAK_PACK_MTD) && CaPmtList.caPmts.Size()) ? CaPmtList.caPmts[0] : NULL; // PACK_MTD: append to existing CaPmt
+  if (CaPmt)
+     CaPmt->UseSourceTransponder(source, transponder); // PACK_MTD: switch to source and transponder of this MtdCamSlot
+  else
+     CaPmtList.caPmts.Clear();
+
   const int *CaSystemIds = GetCaSystemIds();
   if (CaSystemIds && *CaSystemIds) {
+     activeProgsPrev = activeProgs;
+     activeProgs = 0;
+     activePids = 0;
      if (caProgramList.Count()) {
         for (cCiCaProgramData *p = caProgramList.First(); p; p = caProgramList.Next(p)) {
-            if (p->modified || resendPmt) {
-               bool Active = p->Active();
-               cCiCaPmt *CaPmt = CaPmtList.Add(Active ? CmdId : CPCI_NOT_SELECTED, source, transponder, p->programNumber, CaSystemIds);
+            bool Active = p->Active();
+            if (p->modified || resendPmt || (caPmtPack && caplModified)) {
+
+               if (!caPmtPack) // VDR default
+                  CaPmt = CaPmtList.Add(Active ? CmdId : CPCI_NOT_SELECTED, source, transponder, p->programNumber, CaSystemIds);
+               else {          // PACK_CAPMT
+                  if (!CaPmt) {
+                     CaPmt = CaPmtList.Add(caplActive ? CmdId : CPCI_NOT_SELECTED, source, transponder, p->programNumber, CaSystemIds, caPmtPack);
+                     CaPmt->SetSid(GetCaPmtSid(p->programNumber));
+                     }
+                  else
+                     CaPmt->UseProgramNumber(p->programNumber); // PACK_MCD/PACK_MTD: switch the programNumber for ca-descriptors
+                  }
+               uint16_t CaPmtSid = CaPmt->GetSid();
+               DBGCAPMT("%s CAM %d/%d: Sid %d (%X) -> %d (%X) %s", __func__, SlotNumber(), MtdNumber(), p->programNumber, p->programNumber, CaPmtSid, CaPmtSid, resendPmt ? "*resend*" : "");
+
                for (cCiCaPidData *q = p->pidList.First(); q; q = p->pidList.Next(q)) {
-                   if (q->active)
+                   if (q->active || (p->modified && (caPmtOpts & CAMTWEAK_DESELECT))) {
+                      CaPmt->UseCmdId(q->active ? CmdId : CPCI_NOT_SELECTED);
                       CaPmt->AddPid(q->pid, q->streamType);
+                      }
+                   DBGCAPMT("%s CAM %d/%d: Pid %d (%X) %s", __func__, SlotNumber(), MtdNumber(), q->pid, q->pid,
+                            q->active ? p->modified ? "+" : "#" : p->modified && (caPmtOpts & CAMTWEAK_DESELECT) ? "-" : ".");
                    }
+               CaPmt->UseCmdId(CaPmt->ProgramCmdId()); // restore the CmdId at program-level in case AddPid() has changed it
+
                if (caPidReceiver) {
                   int CaPids[MAXRECEIVEPIDS + 1];
                   if (GetCaPids(source, transponder, p->programNumber, CaSystemIds, MAXRECEIVEPIDS + 1, CaPids) > 0) {
@@ -2550,17 +3017,42 @@ void cCamSlot::BuildCaPmts(uint8_t CmdId, cCiCaPmtList &CaPmtList, cMtdMapper *M
                         }
                      }
                   }
-               if (RepliesToQuery())
-                  CaPmt->SetListManagement(Active ? CPLM_ADD : CPLM_UPDATE);
-               if (MtdMapper)
-                  CaPmt->MtdMapPids(MtdMapper);
+               if (!caPmtPack) {
+                  if (McdAvailable())
+                     CaPmt->SetListManagement(Active ? CPLM_ADD : CPLM_UPDATE);
+                  if (MtdMapper)
+                     CaPmt->MtdMapPids(MtdMapper);
+                  }
+               else if (p == caProgramList.Last()) {
+                  if (MasterSlot()->NumCamServices() && McdAvailable())
+                     CaPmt->SetListManagement(MasterSlot()->IsCamService(CaPmtSid) ? CPLM_UPDATE : CPLM_ADD);
+                  if (MtdMapper)
+                     CaPmt->MtdMapEsPids(MtdMapper); // Stream Es/ECM-Pids only
+                  }
+
+               if (!caPmtPack || p == caProgramList.Last())
+                  DBGCAPMT("%s CAM %d/%d: ListManagement %s", __func__, SlotNumber(), MtdNumber(), ListMMs[CaPmt->ListManagement()]);
                p->modified = false;
+               }
+            if (Active) { // update CAM-stats
+               activeProgs++;
+               int pidLimit = scaMapper ? scaMapper->NumPids() : 0;
+               int i = 0;
+               for (cCiCaPidData *q = p->pidList.First(); q; q = p->pidList.Next(q)) {
+                   if (q->active && (!pidLimit || i < pidLimit)) {
+                      activePids++;
+                      i++;
+                      }
+                   }
                }
             }
         }
      else if (CmdId == CPCI_NOT_SELECTED)
-        CaPmtList.Add(CmdId, 0, 0, 0, NULL);
+        CaPmt = CaPmtList.Add(CmdId, 0, 0, 0, NULL);
      }
+  if (CaPmt)
+     DBGCAPMT("%s CAM %d/%d: [%s] ActiveProgs: %d of %d (%d Pids)", __func__, SlotNumber(), MtdNumber(),
+                             CmdIds[CaPmt->CmdId()], activeProgs, caProgramList.Count(), activePids);
 }
 
 void cCamSlot::KeepSharedCaPids(int ProgramNumber, const int *CaSystemIds, int *CaPids)
@@ -2605,15 +3097,32 @@ void cCamSlot::SendCaPmts(cCiCaPmtList &CaPmtList)
   cMutexLock MutexLock(&mutex);
   cCiConditionalAccessSupport *cas = (cCiConditionalAccessSupport *)GetSessionByResourceId(RI_CONDITIONAL_ACCESS_SUPPORT);
   if (cas) {
-     for (int i = 0; i < CaPmtList.caPmts.Size(); i++)
-         cas->SendPMT(CaPmtList.caPmts[i]);
+     if (scaMapper) {
+        scaMapper->MapStaticCaPmts(CaPmtList);
+        }
+     else {
+        for (int i = 0; i < CaPmtList.caPmts.Size(); i++)
+            cas->SendPMT(CaPmtList.caPmts[i]);
+        }
+     if (mtdHandler) {
+        activeProgsPrev = mtdHandler->CamActiveProgsPrev();
+        activeProgs = mtdHandler->CamActiveProgs();
+        activePids = mtdHandler->CamActivePids();
+        }
+     dsyslog("%s CAM %d: [%d] actives in CAM: %d -> %d (%d pids)", __func__,
+                 SlotNumber(), CaPmtList.caPmts.Size(), activeProgsPrev, activeProgs, activePids);
      }
-  resendPmt = false;
 }
 
 void cCamSlot::SendCaPmt(uint8_t CmdId)
 {
   cMutexLock MutexLock(&mutex);
+  caplActive = CaProgramListActive();
+  caplModified = CaProgramListModified();
+  if (mtdHandler) {
+     mtdHandler->SendCaPmt(CmdId, this, resendPmt);
+     return;
+     }
   cCiCaPmtList CaPmtList;
   BuildCaPmts(CmdId, CaPmtList);
   SendCaPmts(CaPmtList);
@@ -2632,6 +3141,7 @@ void cCamSlot::MtdActivate(bool On)
            dsyslog("CAM %d: activating MTD support", SlotNumber());
            mtdHandler = new cMtdHandler;
            }
+           mtdHandler->SetScaMapper(scaMapper); // Set or Update
         }
      else if (mtdHandler) {
         dsyslog("CAM %d: deactivating MTD support", SlotNumber());
@@ -2659,6 +3169,28 @@ int cCamSlot::Priority(void)
      return mtdHandler->Priority();
   cDevice *d = Device();
   return d ? d->Priority() : IDLEPRIORITY;
+}
+
+bool cCamSlot::CaProgramListActive(void)
+{
+  if (mtdHandler)
+     return mtdHandler->CaProgramListActive();
+  for (cCiCaProgramData *p = caProgramList.First(); p; p = caProgramList.Next(p)) {
+      if (p->Active())
+         return true;
+      }
+  return false;
+}
+
+bool cCamSlot::CaProgramListModified(void)
+{
+  if (mtdHandler)
+     return mtdHandler->CaProgramListModified();
+  for (cCiCaProgramData *p = caProgramList.First(); p; p = caProgramList.Next(p)) {
+      if (p->modified)
+         return true;
+      }
+  return false;
 }
 
 bool cCamSlot::ProvidesCa(const int *CaSystemIds)
@@ -2696,6 +3228,8 @@ void cCamSlot::AddPid(int ProgramNumber, int Pid, int StreamType)
 
 void cCamSlot::SetPid(int Pid, bool Active)
 {
+  if (scaMapper)
+     scaMapper->SetPid(Pid, Active);
   if (caPidReceiver && caPidReceiver->HandlingPid())
      return;
   cMutexLock MutexLock(&mutex);
@@ -2741,6 +3275,19 @@ bool cCamSlot::CanDecrypt(const cChannel *Channel, cMtdMapper *MtdMapper)
 {
   if (Channel->Ca() < CA_ENCRYPTED_MIN)
      return true; // channel not encrypted
+  if (camTweakFlags & CAMTWEAK_FORCE_MCD) {
+     bool ok = !camTweakMcdLimit; // any limit ?
+     if (!ok) {
+        int caPmtSid = GetCaPmtSid(Channel->Sid(), MtdMapper ? MtdMapperNumber(MtdMapper) : 0 );
+        if (CaPmtPackMtd() || CaPmtStatic()) // limit is the number of programs packed into one single CA_PMT/Service
+           ok = camTweakMcdLimit > activeProgs;
+        else // limit is the known number of unique CA_PMTs/Services which are accepted by the CAM
+           ok = camTweakMcdLimit > serviceSlotActives.Size() || IsCamService(caPmtSid);
+        DBGCAPMT("CAM %d: %s(%d/%d%s) limit %d - active %d -> %s", SlotNumber(), __func__, Channel->Sid(), caPmtSid, IsCamService(caPmtSid) ? "*" : "-",
+                                  camTweakMcdLimit, (CaPmtPackMtd() || CaPmtStatic()) ? activeProgs : serviceSlotActives.Size(), ok ? "TRUE" : "FALSE");
+        }
+     return ok;
+     }
   if (!IsDecrypting())
      return true; // any CAM can decrypt at least one channel
   cMutexLock MutexLock(&mutex);
@@ -2808,6 +3355,33 @@ bool cCamSlot::IsDecrypting(void)
          }
      }
   return false;
+}
+
+uchar *cCamSlot::ScaMapDecrypt(uchar *Data, int &Count)
+{
+  uchar *d;
+  // Send data to CAM
+  if (Count >= TS_SIZE) {
+     Count = TS_SIZE;
+     int realPid = TsPid(Data);
+     Data = scaMapper->TsPreProcess(Data, Count); // unwanted Pid: Data == NULL, Count == TS_SIZE
+     d = Decrypt(Data, Count);
+     if (Count == 0)
+        TsSetPid(Data, realPid); // must restore PID for later retry
+     }
+  else {
+     Count = 0;
+     d = Decrypt(Data, Count);
+     }
+  // Remap received decrypted data
+  if (d) {
+     int uniqPid = TsPid(d);
+     if (SCAMAPPED(uniqPid))
+        TsSetPid(d, scaMapper->UniqToRealPid(uniqPid));
+     else
+        return NULL; // Injected CAM data or garbagge - need not be returned to device
+     }
+  return d;
 }
 
 uchar *cCamSlot::Decrypt(uchar *Data, int &Count)
@@ -3099,6 +3673,166 @@ void cChannelCamRelations::Save(void)
             if (*s)
                fprintf(f, "%s %s\n", *ccr->ChannelID().ToString(), *s);
             }
+         }
+     f.Close();
+     }
+  else
+     LOG_ERROR_STR(*fileName);
+}
+
+// --- cCaModuleTweak ---------------------------------------------------
+
+cCaModuleTweak::cCaModuleTweak(uint16_t Manuf, uint16_t Mcode, const char *Mname)
+{
+  camManuf = Manuf;
+  camMcode = Mcode;
+  camName  = strdup(Mname);
+  camFlags = 0x0;
+  mcdLimit = 0;
+  scaConf  = NULL;
+}
+
+cCaModuleTweak::~cCaModuleTweak()
+{
+  free(camName);
+  free(scaConf);
+}
+
+void cCaModuleTweak::Set(uint32_t Flags, int Limit, char *ScaConf)
+{
+  camFlags = Flags;
+  mcdLimit = Limit;
+  if (ScaConf) {
+     scaConf = strdup(ScaConf);
+     SetSca();
+     }
+}
+
+void cCaModuleTweak::SetSca(void)
+{
+  vScaConf.Clear();
+  for (char *s = scaConf; s && *s; ) {
+      uint16_t caId = 0;
+      int numSids = 0;
+      int numPids = 0;
+
+      int n = sscanf(s, "%hX:%d:%d", &caId, &numSids, &numPids);
+      if (n == 3) {
+         uint32_t sca = caId << 16 | min(numSids, 255) << 8 | min(numPids, 255);
+         dsyslog("SetSca[%s]: %X,%d,%d = %08X", s, caId, numSids, numPids, sca);
+         vScaConf.Append(sca);
+         }
+      else {
+         dsyslog("SetSca[%s]: Bad format!", s);
+         }
+      if (s = strchr(s, ','))
+         s++;
+      }
+}
+
+// --- cCaModuleTweaks ---------------------------------------------------
+
+cCaModuleTweaks CaModuleTweaks;
+
+cCaModuleTweak *cCaModuleTweaks::GetEntry(uint16_t Manuf, uint16_t Mcode, const char *Mname)
+{
+  cMutexLock MutexLock(&mutex);
+  cCaModuleTweak *cmt = NULL;
+  for (cmt = First(); cmt; cmt = Next(cmt)) {
+      if (cmt->Match(Manuf, Mcode, Mname))
+         return cmt;
+      }
+  return NULL;
+}
+
+cCaModuleTweak *cCaModuleTweaks::AddEntry(uint16_t Manuf, uint16_t Mcode, const char *Mname, uint32_t Flags, int Limit, char *ScaConf)
+{
+  cMutexLock MutexLock(&mutex);
+  cCaModuleTweak *cmt = GetEntry(Manuf, Mcode, Mname);
+  if (!cmt)
+     Add(cmt = new cCaModuleTweak(Manuf, Mcode, Mname));
+  cmt->Set(Flags, Limit, ScaConf);
+  return cmt;
+}
+
+void cCaModuleTweaks::Load(const char *FileName)
+{
+  cMutexLock MutexLock(&mutex);
+  fileName = FileName;
+  if (access(fileName, R_OK) == 0) {
+     dsyslog("loading %s", *fileName);
+     if (FILE *f = fopen(fileName, "r")) {
+        cReadLine ReadLine;
+        char *s;
+
+        uint16_t manuf;
+        uint16_t mcode;
+        uint32_t flags;
+        int      limit;
+
+        while ((s = ReadLine.Read(f)) != NULL) {
+              char *p = strchr(s, '#');
+              if (p)
+                 *p = 0;
+              char *mname = NULL;
+              char *sCaConf = NULL;
+              //int n = sscanf(s, "%X,%d,<%hX:%hX,%m[^>]>,\[%hX,%d,%d]", &flags, &limit, &manuf, &mcode, &mname, &caId, &numSids, &numPids);
+              int n = sscanf(s, "%X,%d,<%hX:%hX,%m[^>]>,[%m[^]]]", &flags, &limit, &manuf, &mcode, &mname, &sCaConf);
+              if (n == 6 || n == 5) // V 2.4 || V 1.0 - 2.3
+                 AddEntry(manuf, mcode, mname, flags, limit, sCaConf);
+              free(mname);
+              free(sCaConf);
+              }
+        fclose(f);
+        }
+     else
+        LOG_ERROR_STR(*fileName);
+     }
+}
+
+void cCaModuleTweaks::Save(void)
+{
+  char help[] = 
+                "# ---  CaModule-Tweaks configfile (experimental) V.2.4 ---\n" \
+                "#  CAM lines are added by VDR\n" \
+                "#  Format [ (*) -> user configurable ]:\n" \
+                "#    (*)Flags,(*)Limit,<AppManufacturer:ManufacturerCode,CamTitle>\n" \
+                "#\n" \
+                "#  Flags (uint32) : OR'ed combination of:\n" \
+                "#                 CAMTWEAK_ENABLED    0x1 - enable/disable tweaks for this module\n" \
+                "#                 CAMTWEAK_FORCE_MCD  0x2 - force multi channel decryption (skip CA_PMT querying)\n" \
+                "#                 CAMTWEAK_AVOID_MTD  0x4 - not all CAMs will work with the MTD generated PIDs\n" \
+                "#                 CAMTWEAK_PACK_MCD   0x10 - pack each CamSlot into a single CA_PMT - for CAMs with limited program slots\n" \
+                "#                 CAMTWEAK_PACK_MTD   0x20 - pack *all* MtdCamSlots into a single CA_PMT - for CAMs with only one program slot\n" \
+                "#                 CAMTWEAK_STATIC_CAPMT 0x40 - create a static CAPMT for configured number of services and pids\n" \
+                "#\n" \
+                "#                 For testing only:\n" \
+                "#                 CAMTWEAK_DESELECT   0x800 - explicitly deselect Pids and ECMs at stream-level with CmdId 'NOT_SELECTED'\n" \
+                "#                 CAMTWEAK_DEBUG      0x1000 - print CamTweaks related debug messages\n" \
+                "#                 CAMTWEAK_DBGMTD     0x2000 - print MTD related debug messages\n" \
+                "#\n" \
+                "#  Limit (int)    : the number of programs the CAM can decrypt simultaneously\n" \
+                "#                 : (applies only if CAMTWEAK_FORCE_MCD is set):\n" \
+                "#                 0 -> no limit (for testing, up to VDR/CAM failure), 1 -> no MCD, 2...n -> a save CAM limit\n" \
+                "#\n" \
+                "#  Example:  0x3,2,<...> tweaks enabled, MCD forced, MTD allowed, CAM can decrypt 2 programs\n" \
+                "#  Example: 0x23,0,<...> tweaks enabled, PACK_MTD (single CA_PMT for MCD+MTD, unlimited number of programs)\n" \
+                "#  Example: 0x43,2,<...>,[0x69C:3:4] tweaks enabled, MTD, static CAPMT for CAID 0x69C, 3 services, max. 4 pids each\n" \
+                "#\n";
+  if (!*fileName)
+     return;
+  cMutexLock MutexLock(&mutex);
+  dsyslog("saving %s", *fileName);
+  cSafeFile f(fileName);
+  if (f.Open()) {
+     fprintf(f, "%s\n", help);
+     for (cCaModuleTweak *cmt = First(); cmt; cmt = Next(cmt)) {
+         bool withStaticOpts = (cmt->CamFlags() & CAMTWEAK_STATIC_CAPMT) || cmt->ScaConf();
+         const char *staticOpts = cmt->ScaConf() ? cmt->ScaConf() : "0x0:0:0";
+         cString s = cString::sprintf(withStaticOpts ? "0x%X,%d,<%04hX:%04hX,%s>,[%s]" : "0x%X,%d,<%04hX:%04hX,%s>",
+                                      cmt->CamFlags(), cmt->McdLimit(), cmt->CamManuf(), cmt->CamMcode(), cmt->CamName(), staticOpts);
+         if (*s)
+            fprintf(f, "%s\n", *s);
          }
      f.Close();
      }
