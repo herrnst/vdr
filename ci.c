@@ -123,6 +123,7 @@ static char *GetString(int &Length, const uint8_t **Data)
 class cCaPidReceiver : public cReceiver {
 private:
   int catVersion;
+  bool scaForceNewCat;
   cVector<int> emmPids;
   uchar buffer[1024]; // CAT table length: 10 bit -> max. 1021 + 3 bytes
   uchar *bufp;
@@ -154,6 +155,7 @@ public:
 cCaPidReceiver::cCaPidReceiver(void)
 {
   catVersion = -1;
+  scaForceNewCat = false;
   bufp = NULL;
   mtdNumCatPackets = 0;
   length = 0;
@@ -217,6 +219,7 @@ void cCaPidReceiver::Receive(const uchar *Data, int Length)
                     if (MtdCamSlot || ScaMapper) {
                        mtdNumCatPackets = 0;
                        memcpy(mtdCatBuffer[mtdNumCatPackets++], Data, TS_SIZE);
+                       scaForceNewCat = catVersion == -1 && ScaMapper;
                        }
                     }
                  else
@@ -280,6 +283,11 @@ void cCaPidReceiver::Receive(const uchar *Data, int Length)
                   }
                }
            if (MtdCamSlot || ScaMapper) {
+              if (scaForceNewCat) {
+                 catVersion = (catVersion + 0xF) & 0x1F; // pretend a version change
+                 uchar *c = const_cast<uchar *>(p + 5);
+                 *c = (*c & ~0x3E) | (catVersion << 1); // patch version
+                 }
               // update crc32
               uint32_t crc = SI::CRC32::crc32((const char *)p, length - 4, 0xFFFFFFFF); // <TableIdCAT....>[crc32]
               uchar *c = const_cast<uchar *>(p + length - 4);
