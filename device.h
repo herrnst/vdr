@@ -86,6 +86,7 @@ struct tTrackId {
 class cPlayer;
 class cReceiver;
 class cLiveSubtitle;
+class cScaMapper;
 
 class cDeviceHook : public cListObject {
 public:
@@ -485,6 +486,10 @@ private:
   cCamSlot *camSlot;
   void ReleaseCamSlot(void);
          ///< Releases the CAM slot if it is currently not used.
+  cScaMapper *scaMapper;
+      /// Set if CamSlots static CAPMT mapping is active
+  bool scaMapMasterSlot;
+      /// True if static CAPMT mapping and MCD (but not MTD) is active
 public:
   virtual bool HasCi(void);
          ///< Returns true if this device has a Common Interface.
@@ -499,6 +504,8 @@ public:
   cCamSlot *CamSlot(void) const { return camSlot; }
          ///< Returns the CAM slot that is currently used with this device,
          ///< or NULL if no CAM slot is in use.
+  cScaMapper *ScaMapper(void) const { return scaMapper; }
+  bool ScaMapMasterSlot(void) const { return scaMapMasterSlot; }
 
 // Image Grab facilities
 
