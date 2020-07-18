@@ -4279,6 +4279,7 @@ void cMenuSetupMisc::Set(void)
   Add(new cMenuEditBoolItem(tr("Setup.Miscellaneous$Channels wrap"),              &data.ChannelsWrap));
   Add(new cMenuEditStraItem(tr("Setup.Miscellaneous$Show channel names with source"), &data.ShowChannelNamesWithSource, 3, showChannelNamesWithSourceTexts));
   Add(new cMenuEditBoolItem(tr("Setup.Miscellaneous$Emergency exit"),             &data.EmergencyExit));
+  Add(new cMenuEditBoolItem(tr("Setup.Miscellaneous$Enable CA module tweaks"),    &data.EnableCamTweaks));
   SetCurrent(Get(current));
   Display();
 }
