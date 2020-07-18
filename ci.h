@@ -77,6 +77,8 @@ public:
   virtual ~cCiApplicationInformation();
   virtual void Process(int Length = 0, const uint8_t *Data = NULL);
   bool EnterMenu(void);
+  uint16_t GetApplicationManufacturer(void) { return applicationManufacturer; }
+  uint16_t GetManufacturerCode(void) { return manufacturerCode; }
   const char *GetMenuString(void) { return menuString; }
   };
 
@@ -221,12 +223,14 @@ class cMtdHandler;
 class cMtdMapper;
 class cMtdCamSlot;
 class cCiCaPmt;
+class cScaMapper;
 
 struct cCiCaPmtList {
   cVector<cCiCaPmt *> caPmts;
   ~cCiCaPmtList();
-  cCiCaPmt *Add(uint8_t CmdId, int Source, int Transponder, int ProgramNumber, const int *CaSystemIds);
+  cCiCaPmt *Add(uint8_t CmdId, int Source, int Transponder, int ProgramNumber, const int *CaSystemIds, uint32_t CamTweaks = 0);
   void Del(cCiCaPmt *CaPmt);
+  cDynamicBuffer *CaPmt(int Index);
   };
 
 class cCamSlot : public cListObject {
@@ -251,7 +255,9 @@ private:
   bool resendPmt;
   int source;
   int transponder;
+public:
   cList<cCiCaProgramData> caProgramList;
+private:
   bool mtdAvailable;
   cMtdHandler *mtdHandler;
   void KeepSharedCaPids(int ProgramNumber, const int *CaSystemIds, int *CaPids);
@@ -262,17 +268,41 @@ private:
   cCiSession *GetSessionByResourceId(uint32_t ResourceId);
   void MtdActivate(bool On);
        ///< Activates (On == true) or deactivates (On == false) MTD.
+  uint32_t camTweakFlags;
+       /// CAM Tweaks : bitmap with flags
+  int camTweakMcdLimit;
+       /// CAM Tweaks : user defined limit for multichannel decryption
+  cVector<uint16_t> serviceSlots;
+  cVector<uint16_t> serviceSlotActives;
+  cVector<uint8_t>  serviceSlotCmdIds;
+public:
+  int activeProgsPrev;
+  int activeProgs;
+  int activePids;
+       /// CAM Tweaks : number of active programs/pids in the CAM Slot.
+  bool caplActive;
+       /// PACK_CAPMT: true if the CAM Slot's caProgramList has active programs.
+  bool caplModified;
+       /// PACK_CAPMT: true if the CAM Slot's caProgramList has modified programs.
+  cScaMapper *scaMapper;
 protected:
   virtual const int *GetCaSystemIds(void);
   virtual void SendCaPmt(uint8_t CmdId);
   virtual bool RepliesToQuery(void);
        ///< Returns true if the CAM in this slot replies to queries and thus
        ///< supports MCD ("Multi Channel Decryption").
+public:
+  bool McdForced(void);
+       ///< Returns true if the CAM in this slot is forced by setup to support MCD
+  int InitStaticCaPmt(cVector<uint32_t> &VscaConf);
+  bool SendStaticCaPmt(cVector<uint32_t> &VscaConf);
+       //// initialize scaMapper and send static CAPMT to CAM
   void BuildCaPmts(uint8_t CmdId, cCiCaPmtList &CaPmtList, cMtdMapper *MtdMapper = NULL);
        ///< Generates all CA_PMTs with the given CmdId and stores them in the given CaPmtList.
        ///< If MtdMapper is given, all SIDs and PIDs will be mapped accordingly.
   void SendCaPmts(cCiCaPmtList &CaPmtList);
        ///< Sends the given list of CA_PMTs to the CAM.
+protected:
   void MtdEnable(void);
        ///< Enables MTD support for this CAM. Note that actual MTD operation also
        ///< requires a CAM that supports MCD ("Multi Channel Decryption").
@@ -281,12 +311,28 @@ protected:
        ///< that are using this CAM. Data must point to the beginning of a TS packet.
        ///< Returns the number of bytes actually processed.
 public:
-  bool McdAvailable(void) { return RepliesToQuery(); }
+  bool McdAvailable(void) { return McdForced() || RepliesToQuery(); }
        ///< Returns true if this CAM supports MCD ("Multi Channel Decyption").
   bool MtdAvailable(void) { return mtdAvailable; }
        ///< Returns true if this CAM supports MTD ("Multi Transponder Decryption").
   bool MtdActive(void) { return mtdHandler != NULL; }
        ///< Returns true if MTD is currently active.
+  virtual int MtdNumber(void) { return 0; }
+       ///< Returns the MTD camslot index + 1' if this CAM supports MTD or '0' for the masterslot.
+  virtual int GetCaPmtSid(int Sid, int MtdNumber = 0);
+       ///< Returns a generated programNumber in case of PACK_CAPMT or the unmodified Sid.
+  void CaPmtTracker(cCiCaPmt *CaPmt);
+  void ResetCaPmtTracker(void);
+  int NumCamServices(void);
+  bool IsCamService(uint16_t Sid);
+  virtual uint32_t GetCamTweakFlags(void) { return camTweakFlags; }
+  void SetCamTweakFlags(uint32_t flags) { camTweakFlags = flags; }
+  void SetCamTweakMcdLimit(int limit) { camTweakMcdLimit = limit; }
+  uint32_t CaPmtPackStatic(void);
+  uint32_t CaPmtPack(void);
+       ///< PACK_CAPMT: Flags (PACK_MCD, PACK_MTD) to tell how all <mtd>CamSlots should be packed into a single caPmt
+  bool     CaPmtPackMtd(void);
+  bool     CaPmtStatic(void);
 public:
   cCamSlot(cCiAdapter *CiAdapter, bool WantsTsData = false, cCamSlot *MasterSlot = NULL);
        ///< Creates a new CAM slot for the given CiAdapter.
@@ -314,7 +360,7 @@ public:
        ///< a call to this function returns a cMtdCamSlot with this CAM slot
        ///< as its master. Otherwise a pointer to this object is returned, which
        ///< means that MTD is not supported.
-  void TriggerResendPmt(void) { resendPmt = true; }
+  void TriggerResendPmt(bool ResendPmt = true) { resendPmt = ResendPmt; }
        ///< Tells this CAM slot to resend the list of CA_PMTs to the CAM.
   virtual bool Assign(cDevice *Device, bool Query = false);
        ///< Assigns this CAM slot to the given Device, if this is possible.
@@ -388,6 +434,10 @@ public:
   int Priority(void);
        ///< Returns the priority of the device this slot is currently assigned
        ///< to, or IDLEPRIORITY if it is not assigned to any device.
+  bool CaProgramListActive(void);
+       /// Returns true if the CAMs caProgramList has active programs
+  bool CaProgramListModified(void);
+       /// Returns true if the CAMs caProgramList has modified programs
   virtual bool ProvidesCa(const int *CaSystemIds);
        ///< Returns true if the CAM in this slot provides one of the given
        ///< CaSystemIds. This doesn't necessarily mean that it will be
@@ -432,6 +482,8 @@ public:
        ///< StopDecrypting().
   virtual bool IsDecrypting(void);
        ///< Returns true if the CAM in this slot is currently used for decrypting.
+  uchar *ScaMapDecrypt(uchar *Data, int &Count);
+       //// CamTweaks: decrypt with static pid mapping
   virtual uchar *Decrypt(uchar *Data, int &Count);
        ///< If this is a CAM slot that can be freely assigned to any device,
        ///< but will not be directly inserted into the full TS data stream
@@ -531,5 +583,49 @@ public:
 extern cChannelCamRelations ChannelCamRelations;
 
 bool CamResponsesLoad(const char *FileName, bool AllowComments = false, bool MustExist = false);
+
+// --- cCaModuleTweaks ---------------------------------------------------
+
+class cCaModuleTweak : public cListObject {
+private:
+  uint16_t camManuf;
+  uint16_t camMcode;
+  char     *camName;
+  uint32_t camFlags;
+  int      mcdLimit;
+  char     *scaConf;
+  cVector<uint32_t> vScaConf;
+public:
+  cCaModuleTweak(uint16_t Manuf, uint16_t Mcode, const char *Mname);
+  ~cCaModuleTweak();
+  uint16_t CamManuf(void) { return camManuf; }
+  uint16_t CamMcode(void) { return camMcode; }
+  char     *CamName(void) { return camName; }
+  uint32_t CamFlags(void) { return camFlags; }
+  int      McdLimit(void) { return mcdLimit; }
+  char     *ScaConf(void) { return scaConf; }
+  cVector<uint32_t> &VscaConf(void) { return vScaConf; }
+
+  bool     Match(uint16_t Manuf, uint16_t Mcode, const char *Mname)
+                { return ((camManuf == Manuf) && (camMcode == Mcode) && !strcmp(camName,Mname)); }
+  void     Set(uint32_t Flags, int Limit, char *ScaConf);
+  void     SetSca(void);
+  };
+
+// --- cCaModuleTweaks ---------------------------------------------------
+
+class cCaModuleTweaks : public cList<cCaModuleTweak> {
+private:
+  cMutex mutex;
+  cString fileName;
+public:
+  cCaModuleTweaks(void) {};
+  cCaModuleTweak *GetEntry(uint16_t Manuf, uint16_t Mcode, const char *Cname);
+  cCaModuleTweak *AddEntry(uint16_t Manuf, uint16_t Mcode, const char *Cname, uint32_t Flags, int Limit, char *ScaConf);
+  void Load(const char *FileName);
+  void Save(void);
+  };
+
+extern cCaModuleTweaks CaModuleTweaks;
 
 #endif //__CI_H
