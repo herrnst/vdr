@@ -287,9 +287,12 @@ cDevice *cDevice::GetDevice(const cChannel *Channel, int Priority, bool LiveView
           bool ndr;
           if (device[i]->ProvidesChannel(Channel, Priority, &ndr)) { // this device is basically able to do the job
              if (NumUsableSlots && !HasInternalCam) {
-                if (cCamSlot *csi = device[i]->CamSlot()) {
-                   cCamSlot *csj = CamSlots.Get(j);
-                   if ((csj->MtdActive() ? csi->MasterSlot() : csi) != csj)
+                cCamSlot *csi = device[i]->CamSlot();
+                cCamSlot *csj = CamSlots.Get(j);
+                if (!csi || csi->MasterSlot() != csj) {
+                   if (csj->McdForced() && !csj->CanDecrypt(Channel))
+                      continue; // CAM slot would be over the limits if adding this channel/service
+                   if (csi)
                       ndr = true; // using a different CAM slot requires detaching receivers
                    }
                 }
@@ -452,6 +455,8 @@ void cDevice::SetCamSlot(cCamSlot *CamSlot)
 {
   LOCK_THREAD;
   camSlot = CamSlot;
+  scaMapper = CamSlot ? CamSlot->scaMapper : NULL;
+  scaMapMasterSlot = scaMapper && CamSlot->IsMasterSlot() && !CamSlot->MtdActive();
 }
 
 void cDevice::Shutdown(void)
@@ -1742,7 +1747,7 @@ void cDevice::Action(void)
                            time_t Now = time(NULL);
                            if (cCamSlot *cs = CamSlot()) {
                               if (Now != Receiver->lastEitInjection) { // once per second
-                                 cs->InjectEit(Receiver->ChannelID().Sid());
+                                 cs->InjectEit(cs->GetCaPmtSid(Receiver->ChannelID().Sid()));
                                  Receiver->lastEitInjection = Now;
                                  }
                               }
