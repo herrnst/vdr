@@ -12,7 +12,7 @@
 #define SCA_MAX_PIDS     MAXPID // real PIDs are 13 bit (0x0000 - 0x1FFF)
 #define SCA_INVALID_PID  0xFFFF // see MTD_INVALID_ID in mtd.c
 
-#define SCA_MAX_SERVICES 16
+#define SCA_MAX_SERVICES 15 // 16 - 1 for a dummy service
 #define SCA_MAX_CAPIDS   16
 #define SCA_MAX_ESPIDS  (SCA_MAX_CAPIDS - 1) // -1 for ECM-Pid
 

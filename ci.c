@@ -950,13 +950,14 @@ bool cCiApplicationInformation::EnterMenu(void)
 #define CAMTWEAK_PACK_MCD  0x10
 #define CAMTWEAK_PACK_MTD  0x20
 #define CAMTWEAK_STATIC_CAPMT 0x40
+#define CAMTWEAK_STATIC_CCSVC 0x80
 
 #define CAMTWEAK_DESELECT  0x800
 #define CAMTWEAK_DEBUG     0x1000
 #define CAMTWEAK_DBGMTD    0x2000
 
 #define CAMTWEAK_PACK_CAPMT (CAMTWEAK_PACK_MCD | CAMTWEAK_PACK_MTD)
-#define CAMTWEAK_OPTS_CAPMT (CAMTWEAK_PACK_CAPMT | CAMTWEAK_STATIC_CAPMT | CAMTWEAK_DESELECT)
+#define CAMTWEAK_OPTS_CAPMT (CAMTWEAK_PACK_CAPMT | CAMTWEAK_STATIC_CAPMT | CAMTWEAK_STATIC_CCSVC | CAMTWEAK_DESELECT)
 
 // --- cCiCaPmt --------------------------------------------------------------
 
@@ -1007,7 +1008,7 @@ public:
   uint16_t GetSid(void) { return capmt.Get(1) << 8 | capmt.Get(2); }
 
   void AddPid(int Pid, uint8_t StreamType);
-  void AddStaticPids(cVector<uint32_t> &VscaConf, cScaMapper *ScaMapper);
+  void AddStaticPids(cVector<uint32_t> &VscaConf, cScaMapper *ScaMapper, bool ccsvc);
   void MtdMapPids(cMtdMapper *MtdMapper);
   void MtdMapEsPids(cMtdMapper *MtdMapper);
 
@@ -1090,7 +1091,7 @@ void cCiCaPmt::AddCaDescriptors(int Length, const uint8_t *Data)
      esyslog("ERROR: adding CA descriptor without Pid!");
 }
 
-void cCiCaPmt::AddStaticPids(cVector<uint32_t> &VscaConf, cScaMapper *ScaMapper)
+void cCiCaPmt::AddStaticPids(cVector<uint32_t> &VscaConf, cScaMapper *ScaMapper, bool ccsvc)
 {
   uint8_t StreamType = 6; // 6: STREAMTYPE_13818_PES_PRIVATE
   uint8_t caDescriptor[6];
@@ -1106,6 +1107,21 @@ void cCiCaPmt::AddStaticPids(cVector<uint32_t> &VscaConf, cScaMapper *ScaMapper)
       caDescriptor[1] = 4;
       caDescriptor[2] = (caId >> 8) & 0xFF;
       caDescriptor[3] =  caId       & 0xFF;
+
+      if (n == 0 && ccsvc) {
+         int slot = SCA_MAX_SERVICES; // unaccessed dummy service
+         int Ecm = ScaMapper->UniqCaPid(slot, 0);
+         int Pid = ScaMapper->UniqCaPid(slot, 1);
+         caDescriptor[4] = (Ecm >> 8) & 0xFF;
+         caDescriptor[5] =  Ecm       & 0xFF;
+         capmt.Append(StreamType);
+         capmt.Append((Pid >> 8) & 0xFF);
+         capmt.Append( Pid       & 0xFF);
+         esInfoLengthPos = capmt.Length();
+         capmt.Append(0x00); // ES_info_length H (at ES level)
+         capmt.Append(0x00); // ES_info_length L
+         AddCaDescriptors(sizeof(caDescriptor), caDescriptor);
+         }
 
       for (int i = 0; i < sids; i++, s++) {
           int Ecm = ScaMapper->UniqCaPid(s, 0);
@@ -1496,7 +1512,7 @@ bool cCiConditionalAccessSupport::ApplyCamTweaks(void)
         }
      }
   else
-     Flags &= ~(CAMTWEAK_PACK_CAPMT | CAMTWEAK_STATIC_CAPMT);
+     Flags &= ~(CAMTWEAK_PACK_CAPMT | CAMTWEAK_STATIC_CAPMT | CAMTWEAK_STATIC_CCSVC);
 
   // enable debuging
   DebugCamtweaks    = Flags & CAMTWEAK_DEBUG;
@@ -1546,6 +1562,7 @@ bool cCiConditionalAccessSupport::ApplyCamTweaks(void)
                       (Flags & CAMTWEAK_FORCE_MCD) ? "MCD" : "",
 
                       (Flags & CAMTWEAK_STATIC_CAPMT) ? " STATIC": "",
+                      (Flags & CAMTWEAK_STATIC_CCSVC) ? " CCSVC": "",
                       (Flags & CAMTWEAK_DESELECT) ? " DESELECT" : "",
                       (Flags & CAMTWEAK_DEBUG) ? " DEBUG" : "",
                       (Flags & CAMTWEAK_DBGMTD) ? " DBGMTD" : "");
@@ -2960,7 +2977,7 @@ bool cCamSlot::SendStaticCaPmt(cVector<uint32_t> &VscaConf)
   cCiCaPmtList CaPmtList;
   // prepare a packed CAPMT
   cCiCaPmt *CaPmt = CaPmtList.Add(CPCI_OK_DESCRAMBLING, 0, 0, Sid, NULL, CAMTWEAK_PACK_MTD);
-  CaPmt->AddStaticPids(VscaConf, scaMapper);
+  CaPmt->AddStaticPids(VscaConf, scaMapper, GetCamTweakFlags() & CAMTWEAK_STATIC_CCSVC);
   CaPmt->SetSid(GetCaPmtSid(Sid));
   cCiConditionalAccessSupport *cas = (cCiConditionalAccessSupport *)GetSessionByResourceId(RI_CONDITIONAL_ACCESS_SUPPORT);
   if (cas)
@@ -3818,6 +3835,7 @@ void cCaModuleTweaks::Save(void)
                 "#                 CAMTWEAK_PACK_MCD   0x10 - pack each CamSlot into a single CA_PMT - for CAMs with limited program slots\n" \
                 "#                 CAMTWEAK_PACK_MTD   0x20 - pack *all* MtdCamSlots into a single CA_PMT - for CAMs with only one program slot\n" \
                 "#                 CAMTWEAK_STATIC_CAPMT 0x40 - create a static CAPMT for configured number of services and pids\n" \
+                "#                 CAMTWEAK_STATIC_CCSVC 0x80 - add a unaccessed dummy as first service to a static CAPMT\n" \
                 "#\n" \
                 "#                 For testing only:\n" \
                 "#                 CAMTWEAK_DESELECT   0x800 - explicitly deselect Pids and ECMs at stream-level with CmdId 'NOT_SELECTED'\n" \
