@@ -3742,6 +3742,8 @@ void cCaModuleTweak::SetSca(void)
 
 cCaModuleTweaks CaModuleTweaks;
 
+static int OldCamTweaksCount = 0;
+
 cCaModuleTweak *cCaModuleTweaks::GetEntry(uint16_t Manuf, uint16_t Mcode, const char *Mname)
 {
   cMutexLock MutexLock(&mutex);
@@ -3759,6 +3761,8 @@ cCaModuleTweak *cCaModuleTweaks::AddEntry(uint16_t Manuf, uint16_t Mcode, const 
   cCaModuleTweak *cmt = GetEntry(Manuf, Mcode, Mname);
   if (!cmt)
      Add(cmt = new cCaModuleTweak(Manuf, Mcode, Mname));
+  else
+     OldCamTweaksCount--; // entries modified
   cmt->Set(Flags, Limit, ScaConf);
   return cmt;
 }
@@ -3792,6 +3796,7 @@ void cCaModuleTweaks::Load(const char *FileName)
               free(sCaConf);
               }
         fclose(f);
+        OldCamTweaksCount = Count();
         }
      else
         LOG_ERROR_STR(*fileName);
@@ -3827,6 +3832,9 @@ void cCaModuleTweaks::Save(void)
                 "#  Example: 0x23,0,<...> tweaks enabled, PACK_MTD (single CA_PMT for MCD+MTD, unlimited number of programs)\n" \
                 "#  Example: 0x43,2,<...>,[0x69C:3:4] tweaks enabled, MTD, static CAPMT for CAID 0x69C, 3 services, max. 4 pids each\n" \
                 "#\n";
+
+  if (Count() == OldCamTweaksCount)
+     return;
   if (!*fileName)
      return;
   cMutexLock MutexLock(&mutex);
